@@ -1,0 +1,14 @@
+// package.json
+{
+  "name": "stripe-webhook-forwarder",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "index.js",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "stripe": "^16.12.0"
+  }
+}
