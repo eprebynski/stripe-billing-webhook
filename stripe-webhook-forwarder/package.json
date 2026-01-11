@@ -1,14 +1,16 @@
-// package.json
 {
   "name": "stripe-webhook-forwarder",
   "version": "1.0.0",
-  "type": "module",
+  "private": true,
   "main": "index.js",
-  "engines": {
-    "node": ">=18"
+  "scripts": {
+    "start": "node index.js"
   },
   "dependencies": {
     "express": "^4.19.2",
-    "stripe": "^16.12.0"
+    "stripe": "^16.0.0"
+  },
+  "engines": {
+    "node": ">=18"
   }
 }
