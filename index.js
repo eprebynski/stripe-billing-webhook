@@ -31,6 +31,7 @@ app.get("/", (_req, res) => res.status(200).send("ok"));
 
 // IMPORTANT: raw body required for Stripe signature verification
 app.post("/stripe-webhook", express.raw({ type: "application/json" }), async (req, res) => {
+  console.log("🔥 Stripe webhook received");
   const reqId = `req_${Date.now()}_${Math.random().toString(16).slice(2)}`;
   try {
     const sig = req.headers["stripe-signature"];
