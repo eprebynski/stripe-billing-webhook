@@ -1,9 +1,9 @@
-const express = require("express");
-const Stripe = require("stripe");
+import express from "express";
+import Stripe from "stripe";
+
+// Node 20+ has global fetch
 
 const app = express();
-
-// ---- Config ----
 const PORT = process.env.PORT || 8080;
 
 const STRIPE_WEBHOOK_SECRET = (process.env.STRIPE_WEBHOOK_SECRET || "").trim();
@@ -13,37 +13,47 @@ const BILLING_WEBHOOK_SHARED_SECRET = (process.env.BILLING_WEBHOOK_SHARED_SECRET
 const allowedTypes = new Set(
   (process.env.ALLOWED_EVENT_TYPES || "invoice.paid,invoice.payment_failed,invoice.finalized")
     .split(",")
-    .map(s => s.trim())
+    .map((s) => s.trim())
     .filter(Boolean)
 );
 
-// Stripe lib needs *some* key string; not used for webhook verification.
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || "sk_placeholder");
+if (!STRIPE_WEBHOOK_SECRET) console.warn("Missing STRIPE_WEBHOOK_SECRET");
+if (!APPS_SCRIPT_WEBHOOK_URL) console.warn("Missing APPS_SCRIPT_WEBHOOK_URL");
+if (!BILLING_WEBHOOK_SHARED_SECRET) console.warn("Missing BILLING_WEBHOOK_SHARED_SECRET");
 
-// ---- Health ----
+// Stripe object is only used for webhook signature verification here
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || "sk_test_placeholder", {
+  apiVersion: "2024-06-20",
+});
+
+// Health
 app.get("/", (_req, res) => res.status(200).send("ok"));
 
-// ---- Stripe webhook (RAW body required) ----
+// IMPORTANT: raw body required for Stripe signature verification
 app.post("/stripe-webhook", express.raw({ type: "application/json" }), async (req, res) => {
+  const reqId = `req_${Date.now()}_${Math.random().toString(16).slice(2)}`;
   try {
     const sig = req.headers["stripe-signature"];
-    if (!sig) return res.status(400).send("Missing Stripe-Signature header");
-    if (!STRIPE_WEBHOOK_SECRET) return res.status(500).send("Missing STRIPE_WEBHOOK_SECRET");
+    if (!sig) {
+      console.warn(`[${reqId}] Missing stripe-signature header`);
+      return res.status(400).send("Missing Stripe-Signature header");
+    }
 
     let event;
     try {
       event = stripe.webhooks.constructEvent(req.body, sig, STRIPE_WEBHOOK_SECRET);
     } catch (err) {
-      console.error("Bad signature:", err && err.message ? err.message : err);
+      console.error(`[${reqId}] Stripe signature verification failed:`, err?.message || err);
       return res.status(400).send("Bad signature");
     }
 
     if (!allowedTypes.has(event.type)) {
-      return res.status(200).send("Ignored event type");
+      console.log(`[${reqId}] Ignored event type: ${event.type}`);
+      return res.status(200).send("Ignored");
     }
 
     if (!APPS_SCRIPT_WEBHOOK_URL || !BILLING_WEBHOOK_SHARED_SECRET) {
-      console.error("Missing APPS_SCRIPT_WEBHOOK_URL or BILLING_WEBHOOK_SHARED_SECRET");
+      console.error(`[${reqId}] Server misconfigured: missing APPS_SCRIPT_WEBHOOK_URL or BILLING_WEBHOOK_SHARED_SECRET`);
       return res.status(500).send("Server misconfigured");
     }
 
@@ -56,49 +66,112 @@ app.post("/stripe-webhook", express.raw({ type: "application/json" }), async (re
       data: simplified,
     };
 
-    const resp = await fetch(APPS_SCRIPT_WEBHOOK_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(forwardBody),
-      redirect: "follow",
-    });
+    const forwardResult = await postJsonPreservePostAcrossRedirects_(APPS_SCRIPT_WEBHOOK_URL, forwardBody, reqId);
 
-    const text = await resp.text();
-    if (!resp.ok) {
-      console.error("Apps Script forward failed:", resp.status, text);
+    if (!forwardResult.ok) {
+      // Return non-2xx so Stripe retries
+      console.error(`[${reqId}] Forward failed:`, forwardResult);
       return res.status(502).send("Forward failed");
     }
 
+    console.log(
+      `[${reqId}] Forwarded OK: status=${forwardResult.status} finalUrl=${forwardResult.finalUrl} body=${truncate_(forwardResult.text, 300)}`
+    );
     return res.status(200).send("Forwarded OK");
   } catch (err) {
-    console.error("Webhook handler error:", err);
+    console.error(`[${reqId}] Handler error:`, err);
     return res.status(500).send("Server error");
   }
 });
 
-function simplifyStripeEvent(event) {
-  const obj = (event && event.data && event.data.object) ? event.data.object : {};
+async function postJsonPreservePostAcrossRedirects_(url, obj, reqId) {
+  const body = JSON.stringify(obj);
+  const headers = { "Content-Type": "application/json" };
 
-  if (String(event.type || "").startsWith("invoice.")) {
-    const createdAt = obj.created ? new Date(obj.created * 1000).toISOString() : "";
-    const paidUnix = obj?.status_transitions?.paid_at != null ? obj.status_transitions.paid_at : null;
-    const paidAt = paidUnix ? new Date(paidUnix * 1000).toISOString() : "";
+  // 1) POST with redirect: 'manual' so we can catch 302/303
+  const r1 = await fetch(url, {
+    method: "POST",
+    headers,
+    body,
+    redirect: "manual",
+  });
+
+  const t1 = await safeText_(r1);
+
+  // If OK, done
+  if (r1.ok) {
+    return { ok: true, status: r1.status, finalUrl: url, text: t1 };
+  }
+
+  // If redirect, re-POST to Location (this is the critical fix)
+  const isRedirect = [301, 302, 303, 307, 308].includes(r1.status);
+  const loc = r1.headers.get("location");
+
+  if (isRedirect && loc) {
+    console.log(`[${reqId}] Apps Script redirect ${r1.status} -> ${loc}`);
+
+    const r2 = await fetch(loc, {
+      method: "POST",
+      headers,
+      body,
+      redirect: "manual",
+    });
+
+    const t2 = await safeText_(r2);
+
+    return {
+      ok: r2.ok,
+      status: r2.status,
+      finalUrl: loc,
+      text: t2,
+      firstHop: { status: r1.status, text: truncate_(t1, 200) },
+    };
+  }
+
+  return {
+    ok: false,
+    status: r1.status,
+    finalUrl: url,
+    text: t1,
+  };
+}
+
+function simplifyStripeEvent(event) {
+  const obj = event?.data?.object || {};
+
+  if (event.type.startsWith("invoice.")) {
+    const created = obj.created ? new Date(obj.created * 1000).toISOString() : "";
+    const paidAtUnix = obj?.status_transitions?.paid_at ?? null;
+    const paidAt = paidAtUnix ? new Date(paidAtUnix * 1000).toISOString() : "";
 
     return {
       invoiceId: obj.id || "",
       status: obj.status || "",
       hostedInvoiceUrl: obj.hosted_invoice_url || "",
-      amountDue: obj.amount_due != null ? Number(obj.amount_due) / 100 : null,
+      amountDue: obj.amount_due != null ? Number(obj.amount_due) / 100 : null, // dollars
       currency: obj.currency || "usd",
-      createdAt,
-      paidAt,
-      metadata: obj.metadata || {},
+      createdAt: created,
+      paidAt: paidAt,
       customer: obj.customer || "",
       number: obj.number || "",
+      metadata: obj.metadata || {},
     };
   }
 
-  return { objectId: obj.id || "", objectType: obj.object || "", rawType: event.type };
+  return { rawType: event.type, objectId: obj.id || "", objectType: obj.object || "" };
 }
 
-app.listen(PORT, () => console.log(`Listening on ${PORT}`));
+async function safeText_(resp) {
+  try {
+    return await resp.text();
+  } catch {
+    return "";
+  }
+}
+
+function truncate_(s, n) {
+  s = String(s || "");
+  return s.length > n ? s.slice(0, n) + "..." : s;
+}
+
+app.listen(PORT, () => console.log(`Listening on port ${PORT}`));
