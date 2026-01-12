@@ -114,52 +114,56 @@ async function postJsonPreservePostAcrossRedirects_(url, obj, reqId) {
   const body = JSON.stringify(obj);
   const headers = { "Content-Type": "application/json" };
 
-  // 1) POST without auto-follow so we can catch 302/303
-  const r1 = await fetch(url, {
-    method: "POST",
-    headers,
-    body,
-    redirect: "manual",
-  });
+  let currentUrl = url;
+  let lastStatus = 0;
+  let lastText = "";
+  let hops = 0;
 
-  const t1 = await safeText_(r1);
-
-  // Success on first hop
-  if (r1.ok) {
-    return { ok: true, status: r1.status, finalUrl: url, text: t1 };
-  }
-
-  // 2) If redirect, manually re-POST to Location (this is the fix)
-  const isRedirect = [301, 302, 303, 307, 308].includes(r1.status);
-  const loc = r1.headers.get("location");
-
-  if (isRedirect && loc) {
-    console.log(`[${reqId}] Apps Script redirect ${r1.status} -> ${loc}`);
-
-    const r2 = await fetch(loc, {
-      method: "POST", // preserve POST
+  while (hops < 5) {
+    const resp = await fetch(currentUrl, {
+      method: "POST",
       headers,
       body,
       redirect: "manual",
     });
 
-    const t2 = await safeText_(r2);
+    lastStatus = resp.status;
+    lastText = await safeText_(resp);
 
+    // Success
+    if (resp.ok) {
+      return { ok: true, status: resp.status, finalUrl: currentUrl, text: lastText, hops };
+    }
+
+    // Redirect handling
+    const loc = resp.headers.get("location");
+    const isRedirect = [301, 302, 303, 307, 308].includes(resp.status);
+
+    if (isRedirect && loc) {
+      const nextUrl = new URL(loc, currentUrl).toString();
+      console.log(`[${reqId}] Redirect hop ${hops + 1}: ${resp.status} -> ${nextUrl}`);
+      currentUrl = nextUrl;
+      hops += 1;
+      continue;
+    }
+
+    // Non-redirect failure
     return {
-      ok: r2.ok,
-      status: r2.status,
-      finalUrl: loc,
-      text: t2,
-      firstHop: { status: r1.status, text: truncate_(t1, 200) },
+      ok: false,
+      status: resp.status,
+      finalUrl: currentUrl,
+      text: lastText,
+      hops,
     };
   }
 
-  // Non-redirect failure
+  // Too many redirects
   return {
     ok: false,
-    status: r1.status,
-    finalUrl: url,
-    text: t1,
+    status: lastStatus || 0,
+    finalUrl: currentUrl,
+    text: `Too many redirects. Last body: ${truncate_(lastText, 200)}`,
+    hops,
   };
 }
 
