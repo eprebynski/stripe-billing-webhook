@@ -47,6 +47,7 @@ app.post("/stripe-webhook", express.raw({ type: "application/json" }), async (re
     let event;
     try {
       event = stripe.webhooks.constructEvent(req.body, sig, STRIPE_WEBHOOK_SECRET);
+      console.log(`[${reqId}] Stripe event ${event.id} type=${event.type}`);
     } catch (err) {
       console.error(
         `[${reqId}] Stripe signature verification failed:`,
@@ -114,56 +115,70 @@ async function postJsonPreservePostAcrossRedirects_(url, obj, reqId) {
   const body = JSON.stringify(obj);
   const headers = { "Content-Type": "application/json" };
 
-  let currentUrl = url;
-  let lastStatus = 0;
-  let lastText = "";
-  let hops = 0;
+  // IMPORTANT:
+  // Apps Script often returns 302 -> script.googleusercontent.com/macros/echo...
+  // The script has already executed at that point.
+  // Following that redirect with POST typically yields 405 (GET/HEAD only).
+  // So we treat a redirect to googleusercontent as SUCCESS.
 
-  while (hops < 5) {
-    const resp = await fetch(currentUrl, {
-      method: "POST",
-      headers,
-      body,
-      redirect: "manual",
-    });
+  const r1 = await fetch(url, {
+    method: "POST",
+    headers,
+    body,
+    redirect: "manual", // we inspect 302 ourselves
+  });
 
-    lastStatus = resp.status;
-    lastText = await safeText_(resp);
+  const t1 = await safeText_(r1);
+  const loc = r1.headers.get("location") || "";
 
-    // Success
-    if (resp.ok) {
-      return { ok: true, status: resp.status, finalUrl: currentUrl, text: lastText, hops };
-    }
-
-    // Redirect handling
-    const loc = resp.headers.get("location");
-    const isRedirect = [301, 302, 303, 307, 308].includes(resp.status);
-
-    if (isRedirect && loc) {
-      const nextUrl = new URL(loc, currentUrl).toString();
-      console.log(`[${reqId}] Redirect hop ${hops + 1}: ${resp.status} -> ${nextUrl}`);
-      currentUrl = nextUrl;
-      hops += 1;
-      continue;
-    }
-
-    // Non-redirect failure
-    return {
-      ok: false,
-      status: resp.status,
-      finalUrl: currentUrl,
-      text: lastText,
-      hops,
-    };
+  // 2xx = success
+  if (r1.status >= 200 && r1.status < 300) {
+    return { ok: true, status: r1.status, finalUrl: url, text: t1 };
   }
 
-  // Too many redirects
+  // 301/302/303/307/308 can happen
+  const isRedirect = [301, 302, 303, 307, 308].includes(r1.status);
+
+  if (isRedirect) {
+    console.log(`[${reqId}] Apps Script responded redirect ${r1.status} -> ${loc}`);
+
+    // ✅ If redirect is to googleusercontent "echo", treat as success.
+    // Apps Script already ran and generated that echo URL.
+    if (loc.includes("script.googleusercontent.com/macros/echo")) {
+      return {
+        ok: true,
+        status: r1.status,
+        finalUrl: loc,
+        text: t1,
+        note: "Treated Apps Script 302->googleusercontent as success (script executed).",
+      };
+    }
+
+    // Optional: if it redirects somewhere else, do ONE safe follow as GET
+    // (POST-follow is what causes 405 on googleusercontent)
+    if (loc) {
+      const r2 = await fetch(loc, {
+        method: "GET",
+        redirect: "manual",
+      });
+      const t2 = await safeText_(r2);
+      return {
+        ok: r2.status >= 200 && r2.status < 300,
+        status: r2.status,
+        finalUrl: loc,
+        text: t2,
+        firstHop: { status: r1.status, location: loc, text: truncate_(t1, 200) },
+      };
+    }
+  }
+
+  // Anything else = failure
   return {
     ok: false,
-    status: lastStatus || 0,
-    finalUrl: currentUrl,
-    text: `Too many redirects. Last body: ${truncate_(lastText, 200)}`,
-    hops,
+    status: r1.status,
+    finalUrl: url,
+    text: t1,
+    location: loc,
   };
 }
 
